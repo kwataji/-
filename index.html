@@ -1,572 +1,407 @@
-import React, { useState, useEffect, useRef } from 'react';
-import { initializeApp } from 'firebase/app';
-import { getAuth, signInAnonymously, signInWithCustomToken, onAuthStateChanged } from 'firebase/auth';
-import { getFirestore, collection, addDoc, query, where, onSnapshot, updateDoc, doc, deleteDoc, getDocs } from 'firebase/firestore';
-
-// Firebase settings are provided by the Canvas environment
-const firebaseConfig = typeof __firebase_config !== 'undefined' ? JSON.parse(__firebase_config) : {};
-const appId = typeof __app_id !== 'undefined' ? __app_id : 'default-app-id';
-const initialAuthToken = typeof __initial_auth_token !== 'undefined' ? __initial_auth_token : null;
-
-// Initialize Firebase
-const app = initializeApp(firebaseConfig);
-const db = getFirestore(app);
-const auth = getAuth(app);
-
-// Update job types
-const JOB_TYPES = ['阪急', 'リール', 'その他'];
-
-// Helper function to generate Firestore collection path
-const getCollectionPath = (userId, monthYear) => {
-    // Store as public data (can be changed to private data if needed)
-    return `artifacts/${appId}/public/data/jobs/${userId}/${monthYear}`;
-};
-
-const App = () => {
-    const [jobs, setJobs] = useState([]);
-    const [newJobTitle, setNewJobTitle] = useState('');
-    const [newJobType, setNewJobType] = useState(JOB_TYPES[0]);
-    const [selectedMonth, setSelectedMonth] = useState(new Date().toISOString().slice(0, 7)); // YYYY-MM format
-    const [userId, setUserId] = useState(null);
-    const [isAuthReady, setIsAuthReady] = useState(false);
-
-    // Modal related states
-    const [showModal, setShowModal] = useState(false);
-    const [modalMessage, setModalMessage] = useState('');
-    const [modalType, setModalType] = useState('info'); // 'info', 'deleteConfirm'
-    const [jobToDelete, setJobToDelete] = useState(null);
-
-    // Gemini API related states
-    const [suggestedJobDetails, setSuggestedJobDetails] = useState('');
-    const [isGenerating, setIsGenerating] = useState(false); // Loading state for suggestion generation
-
-    // Monitor authentication status and initialize Firestore
-    useEffect(() => {
-        const unsubscribe = onAuthStateChanged(auth, async (user) => {
-            if (user) {
-                setUserId(user.uid);
-            } else {
-                // Use auth token if available, otherwise anonymous auth
-                try {
-                    if (initialAuthToken) {
-                        await signInWithCustomToken(auth, initialAuthToken);
-                    } else {
-                        await signInAnonymously(auth);
-                    }
-                    setUserId(auth.currentUser?.uid || crypto.randomUUID()); // Get uid even after anonymous auth
-                } catch (error) {
-                    console.error("Authentication error:", error);
-                    setUserId(crypto.randomUUID()); // Generate random ID on error
-                }
-            }
-            setIsAuthReady(true);
-        });
-        return () => unsubscribe();
-    }, []);
-
-    // Fetch data from Firestore based on selected month and user ID
-    useEffect(() => {
-        if (!isAuthReady || !userId) return;
-
-        const collectionPath = getCollectionPath(userId, selectedMonth);
-        const q = query(collection(db, collectionPath));
-
-        const unsubscribe = onSnapshot(q, (snapshot) => {
-            const jobsData = snapshot.docs.map(doc => ({
-                id: doc.id,
-                ...doc.data()
-            }));
-            // Sort by date (client-side)
-            jobsData.sort((a, b) => {
-                const dateA = a.inProgressDate ? new Date(a.inProgressDate) : new Date(0);
-                const dateB = b.inProgressDate ? new Date(b.inProgressDate) : new Date(0);
-                return dateB - dateA; // Descending order for newer items on top
-            });
-            setJobs(jobsData);
-        }, (error) => {
-            console.error("Firestore data fetch error:", error);
-            setModalMessage("データの取得中にエラーが発生しました。");
-            setModalType('info');
-            setShowModal(true);
-        });
-
-        return () => unsubscribe();
-    }, [selectedMonth, userId, isAuthReady]);
-
-    // Month change handler
-    const handleMonthChange = (e) => {
-        setSelectedMonth(e.target.value);
-    };
-
-    // Generic job movement function
-    const moveJobsBetweenMonths = async (jobsToMove, fromMonth, toMonth) => {
-        if (!userId) return;
-        try {
-            for (const job of jobsToMove) {
-                // Add to new month
-                await addDoc(collection(db, getCollectionPath(userId, toMonth)), {
-                    ...job,
-                    id: undefined, // Firestore auto-generates ID, so remove
-                    movedFromMonth: fromMonth, // Record which month it was moved from
-                });
-                // Delete from original month
-                await deleteDoc(doc(db, getCollectionPath(userId, fromMonth), job.id));
-            }
-            setModalMessage(`${jobsToMove.length} 件の仕事を移動しました。`);
-            setModalType('info');
-            setShowModal(true);
-        } catch (e) {
-            console.error("Job move error:", e);
-            setModalMessage("仕事の移動中にエラーが発生しました。");
-            setModalType('info');
-            setShowModal(true);
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Gemini仕事進捗アプリ</title>
+    <!-- Tailwind CSS CDN -->
+    <script src="https://cdn.tailwindcss.com"></script>
+    <style>
+        /* Interフォントの指定 */
+        body {
+            font-family: 'Inter', sans-serif;
         }
-    };
-
-    // Add new job
-    const addJob = async () => {
-        if (!newJobTitle.trim() || !userId) {
-            setModalMessage("仕事のタイトルを入力してください。");
-            setModalType('info');
-            setShowModal(true);
-            return;
+        /* スクロールバーのスタイル（任意） */
+        ::-webkit-scrollbar {
+            width: 8px;
         }
-
-        // 修正: slice(0, 7) を使用して YYYY-MM 形式を取得
-        const currentMonth = new Date().toISOString().slice(0, 7);
-        const collectionPath = getCollectionPath(userId, currentMonth);
-
-        try {
-            await addDoc(collection(db, collectionPath), {
-                title: newJobTitle,
-                type: newJobType,
-                inProgress: false,
-                completed: false,
-                inProgressDate: null,
-                completedDate: null,
-                createdAt: new Date().toISOString(),
-            });
-            setNewJobTitle('');
-            setNewJobType(JOB_TYPES[0]);
-            setSuggestedJobDetails(''); // Clear suggestion after adding job
-        } catch (e) {
-            console.error("Job add error:", e);
-            setModalMessage("仕事の追加中にエラーが発生しました。");
-            setModalType('info');
-            setShowModal(true);
+        ::-webkit-scrollbar-track {
+            background: #f1f1f1;
+            border-radius: 10px;
         }
-    };
-
-    // Update job status
-    const updateJobStatus = async (jobId, currentStatus, fieldName) => {
-        if (!userId) return;
-
-        const jobRef = doc(db, getCollectionPath(userId, selectedMonth), jobId);
-        const now = new Date().toISOString();
-        let updateData = {};
-
-        if (fieldName === 'inProgress') {
-            updateData = {
-                inProgress: !currentStatus,
-                inProgressDate: !currentStatus ? now : null,
-                completed: !currentStatus ? false : false, // Uncheck completed if in progress
-                completedDate: !currentStatus ? null : null, // Clear completed date if in progress
-            };
-        } else if (fieldName === 'completed') {
-            updateData = {
-                completed: !currentStatus,
-                completedDate: !currentStatus ? now : null,
-                inProgress: !currentStatus ? true : false, // Set to in progress if completed
-                inProgressDate: !currentStatus && !jobs.find(j => j.id === jobId)?.inProgressDate ? now : jobs.find(j => j.id === jobId)?.inProgressDate, // Set inProgressDate if not already set when completed
-            };
+        ::-webkit-scrollbar-thumb {
+            background: #888;
+            border-radius: 10px;
         }
-
-        try {
-            await updateDoc(jobRef, updateData);
-        } catch (e) {
-            console.error("Job status update error:", e);
-            setModalMessage("仕事のステータス更新中にエラーが発生しました。");
-            setModalType('info');
-            setShowModal(true);
+        ::-webkit-scrollbar-thumb:hover {
+            background: #555;
         }
-    };
+    </style>
+</head>
+<body class="bg-gray-100 p-4 min-h-screen flex flex-col items-center">
+    <div class="max-w-4xl w-full bg-white rounded-xl shadow-lg p-6 md:p-8">
+        <h1 class="text-3xl font-bold text-center text-gray-800 mb-6">Gemini仕事進捗アプリ</h1>
 
-    // Handler for moving incomplete jobs of the current month to the next month
-    const handleMoveCurrentMonthIncompleteJobs = async () => {
-        if (!userId) return;
+        <!-- ユーザーID表示エリア -->
+        <div class="text-right text-sm text-gray-600 mb-4">
+            現在のユーザーID: <span id="displayUserId" class="font-mono text-blue-700 break-all">認証中...</span>
+        </div>
 
-        const incompleteJobs = jobs.filter(job => !job.completed);
-        if (incompleteJobs.length === 0) {
-            setModalMessage("完了していない仕事はありません。");
-            setModalType('info');
-            setShowModal(true);
-            return;
-        }
+        <!-- 月ナビゲーション -->
+        <div class="flex justify-between items-center mb-6 bg-blue-50 p-3 rounded-lg shadow-sm">
+            <button id="prevMonthBtn" class="px-4 py-2 bg-blue-500 text-white rounded-lg hover:bg-blue-600 transition duration-200 ease-in-out shadow-md">
+                &lt; 前の月
+            </button>
+            <h2 id="currentMonthDisplay" class="text-2xl font-semibold text-blue-700"></h2>
+            <button id="nextMonthBtn" class="px-4 py-2 bg-blue-500 text-white rounded-lg hover:bg-blue-600 transition duration-200 ease-in-out shadow-md">
+                次の月 &gt;
+            </button>
+        </div>
 
-        const nextMonthDate = new Date(new Date(selectedMonth + '-01').setMonth(new Date(selectedMonth + '-01').getMonth() + 1));
-        const nextMonth = nextMonthDate.toISOString().slice(0, 7);
-        await moveJobsBetweenMonths(incompleteJobs, selectedMonth, nextMonth);
-    };
-
-    // Show confirmation modal for deleting a job
-    const confirmDeleteJob = (job) => {
-        setJobToDelete(job);
-        setModalMessage(`「${job.title}」を削除しますか？`);
-        setModalType('deleteConfirm');
-        setShowModal(true);
-    };
-
-    // Delete job
-    const deleteJob = async () => {
-        if (!jobToDelete || !userId) return;
-
-        try {
-            await deleteDoc(doc(db, getCollectionPath(userId, selectedMonth), jobToDelete.id));
-            setModalMessage("仕事を削除しました。");
-            setModalType('info');
-            setShowModal(true);
-            setJobToDelete(null);
-        } catch (e) {
-            console.error("Job deletion error:", e);
-            setModalMessage("仕事の削除中にエラーが発生しました。");
-            setModalType('info');
-            setShowModal(true);
-        }
-    };
-
-    // Close modal
-    const closeModal = () => {
-        setShowModal(false);
-        setModalMessage('');
-        setModalType('info');
-        setJobToDelete(null);
-    };
-
-    // Generate month options for the selector
-    const generateMonthOptions = () => {
-        const options = [];
-        const today = new Date();
-        for (let i = -6; i <= 6; i++) { // 6 months before and after current month
-            const date = new Date(today.getFullYear(), today.getMonth() + i, 1);
-            options.push(date.toISOString().slice(0, 7));
-        }
-        return options;
-    };
-
-    // Use Gemini API to generate job details
-    const generateJobDetails = async () => {
-        if (!newJobTitle.trim()) {
-            setModalMessage("仕事のタイトルを入力してから提案を生成してください。");
-            setModalType('info');
-            setShowModal(true);
-            return;
-        }
-
-        setIsGenerating(true);
-        setSuggestedJobDetails(''); // Clear previous suggestion
-
-        const prompt = `以下の仕事のタイトルについて、簡潔な説明を生成してください。または、その仕事の主要なサブタスクを箇条書きで3つ提案してください。：${newJobTitle}`;
-        let chatHistory = [];
-        chatHistory.push({ role: "user", parts: [{ text: prompt }] });
-
-        const payload = { contents: chatHistory };
-        const apiKey = ""; // Empty string as it's provided by Canvas environment
-
-        const apiUrl = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=${apiKey}`;
-
-        try {
-            const response = await fetch(apiUrl, {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify(payload)
-            });
-            const result = await response.json();
-
-            if (result.candidates && result.candidates.length > 0 &&
-                result.candidates[0].content && result.candidates[0].content.parts &&
-                result.candidates[0].content.parts.length > 0) {
-                const text = result.candidates[0].content.parts[0].text;
-                setSuggestedJobDetails(text);
-            } else {
-                setModalMessage("提案の生成に失敗しました。");
-                setModalType('info');
-                setShowModal(true);
-            }
-        } catch (error) {
-            console.error("Gemini API call error:", error);
-            setModalMessage("提案の生成中にエラーが発生しました。");
-            setModalType('info');
-            setShowModal(true);
-        } finally {
-            setIsGenerating(false);
-        }
-    };
-
-    // Filtered job list
-    const filteredJobs = jobs.filter(job => {
-        // Filter by job type
-        if (filterJobType !== 'すべて' && job.type !== filterJobType) {
-            return false;
-        }
-        // Filter by completion status
-        if (filterCompletionStatus === '完了' && !job.completed) {
-            return false;
-        }
-        if (filterCompletionStatus === '未完了' && job.completed) {
-            return false;
-        }
-        return true;
-    });
-
-    // Filtering states
-    const [filterJobType, setFilterJobType] = useState('すべて'); // 'すべて' or one of JOB_TYPES
-    const [filterCompletionStatus, setFilterCompletionStatus] = useState('すべて'); // 'すべて', '完了', '未完了'
-
-    // useEffect to check for incomplete jobs from the previous month and automatically move them
-    const prevSelectedMonthRef = useRef(); // Ref to track previous selectedMonth
-
-    useEffect(() => {
-        if (!isAuthReady || !userId || !selectedMonth) return;
-
-        // Execute only when selectedMonth changes
-        if (prevSelectedMonthRef.current && prevSelectedMonthRef.current !== selectedMonth) {
-            const checkAndAutoMovePreviousMonthJobs = async () => {
-                const prevMonthDate = new Date(new Date(selectedMonth + '-01').setMonth(new Date(selectedMonth + '-01').getMonth() - 1));
-                const prevMonthString = prevMonthDate.toISOString().slice(0, 7);
-
-                const prevMonthCollectionPath = getCollectionPath(userId, prevMonthString);
-                const qPrevMonth = query(collection(db, prevMonthCollectionPath), where('completed', '==', false));
-
-                try {
-                    const snapshot = await getDocs(qPrevMonth); // Get data once
-                    const incompleteJobs = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
-
-                    if (incompleteJobs.length > 0) {
-                        // Automatically move jobs without prompting
-                        await moveJobsBetweenMonths(incompleteJobs, prevMonthString, selectedMonth);
-                    }
-                } catch (error) {
-                    console.error("Error checking previous month's incomplete jobs:", error);
-                    setModalMessage("前月の未完了仕事のチェック中にエラーが発生しました。");
-                    setModalType('info');
-                    setShowModal(true);
-                }
-            };
-            checkAndAutoMovePreviousMonthJobs();
-        }
-        prevSelectedMonthRef.current = selectedMonth; // Save current selectedMonth
-    }, [selectedMonth, userId, isAuthReady]);
-
-    if (!isAuthReady) {
-        return (
-            <div className="flex items-center justify-center min-h-screen bg-gray-100">
-                <p className="text-lg text-gray-700">認証中...</p>
-            </div>
-        );
-    }
-
-    return (
-        <div className="min-h-screen bg-gray-100 p-4 font-inter">
-            {/* Modal */}
-            {showModal && (
-                <div className="fixed inset-0 bg-gray-600 bg-opacity-50 flex items-center justify-center z-50">
-                    <div className="bg-white p-6 rounded-lg shadow-xl max-w-sm w-full text-center">
-                        <p className="text-lg font-semibold mb-4">{modalMessage}</p>
-                        {modalType === 'deleteConfirm' ? (
-                            <div className="flex justify-around">
-                                <button
-                                    onClick={deleteJob}
-                                    className="bg-red-500 hover:bg-red-600 text-white font-bold py-2 px-4 rounded-full shadow-md transition duration-300 ease-in-out"
-                                >
-                                    削除
-                                </button>
-                                <button
-                                    onClick={closeModal}
-                                    className="bg-gray-300 hover:bg-gray-400 text-gray-800 font-bold py-2 px-4 rounded-full shadow-md transition duration-300 ease-in-out"
-                                >
-                                    キャンセル
-                                </button>
-                            </div>
-                        ) : (
-                            <button
-                                onClick={closeModal}
-                                className="bg-blue-500 hover:bg-blue-600 text-white font-bold py-2 px-4 rounded-full shadow-md transition duration-300 ease-in-out"
-                            >
-                                閉じる
-                            </button>
-                        )}
-                    </div>
-                </div>
-            )}
-
-            <div className="max-w-4xl mx-auto bg-white p-6 rounded-xl shadow-lg">
-                <h1 className="text-3xl font-bold text-center text-gray-800 mb-6">Gemini 仕事進捗管理</h1>
-
-                {/* User ID Display */}
-                <div className="text-sm text-gray-600 text-center mb-4 p-2 bg-gray-50 rounded-md">
-                    ユーザーID: <span className="font-mono break-all">{userId}</span>
-                </div>
-
-                {/* Add New Job Form */}
-                <div className="mb-8 p-4 bg-blue-50 rounded-lg shadow-inner">
-                    <h2 className="text-xl font-semibold text-blue-800 mb-4">新しい仕事を追加</h2>
-                    <div className="flex flex-col sm:flex-row gap-4">
-                        <input
-                            type="text"
-                            placeholder="仕事のタイトル"
-                            value={newJobTitle}
-                            onChange={(e) => setNewJobTitle(e.target.value)}
-                            className="flex-grow p-3 border border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-400 focus:border-transparent transition duration-200"
-                        />
-                        <select
-                            value={newJobType}
-                            onChange={(e) => setNewJobType(e.target.value)}
-                            className="p-3 border border-gray-300 rounded-lg bg-white focus:ring-2 focus:ring-blue-400 focus:border-transparent transition duration-200"
-                        >
-                            {JOB_TYPES.map(type => (
-                                <option key={type} value={type}>{type}</option>
-                            ))}
-                        </select>
-                        <button
-                            onClick={addJob}
-                            className="bg-blue-600 hover:bg-blue-700 text-white font-bold py-3 px-6 rounded-full shadow-md transition duration-300 ease-in-out transform hover:scale-105"
-                        >
-                            追加
-                        </button>
-                        <button
-                            onClick={generateJobDetails}
-                            disabled={isGenerating}
-                            className="bg-green-600 hover:bg-green-700 text-white font-bold py-3 px-6 rounded-full shadow-md transition duration-300 ease-in-out transform hover:scale-105"
-                        >
-                            {isGenerating ? '生成中...' : '✨詳細を提案'}
-                        </button>
-                    </div>
-                    {suggestedJobDetails && (
-                        <div className="mt-4 p-3 bg-green-50 border border-green-200 rounded-lg">
-                            <h3 className="text-md font-semibold text-green-800 mb-2">提案された仕事の詳細:</h3>
-                            <textarea
-                                readOnly
-                                value={suggestedJobDetails}
-                                className="w-full p-2 border border-gray-300 rounded-lg bg-white text-gray-700 h-24 resize-y"
-                            />
-                        </div>
-                    )}
-                </div>
-
-                {/* Month Selector and Move to Next Month Button */}
-                <div className="flex flex-col sm:flex-row justify-between items-center mb-6 p-4 bg-gray-50 rounded-lg shadow-inner">
-                    <label htmlFor="month-select" className="text-gray-700 font-medium mb-2 sm:mb-0">月を選択:</label>
-                    <select
-                        id="month-select"
-                        value={selectedMonth}
-                        onChange={handleMonthChange}
-                        className="p-3 border border-gray-300 rounded-lg bg-white focus:ring-2 focus:ring-blue-400 focus:border-transparent transition duration-200 w-full sm:w-auto"
-                    >
-                        {generateMonthOptions().map(month => (
-                            <option key={month} value={month}>{month}</option>
-                        ))}
-                    </select>
-                    <button
-                        onClick={handleMoveCurrentMonthIncompleteJobs}
-                        className="bg-purple-600 hover:bg-purple-700 text-white font-bold py-3 px-6 rounded-full shadow-md transition duration-300 ease-in-out transform hover:scale-105 mt-4 sm:mt-0"
-                    >
-                        完了していない仕事を翌月に移動
-                    </button>
-                </div>
-
-                {/* Filtering Options */}
-                <div className="flex flex-col sm:flex-row gap-4 mb-6 p-4 bg-gray-50 rounded-lg shadow-inner">
-                    <div className="flex-1">
-                        <label htmlFor="filter-type" className="text-gray-700 font-medium mb-2 block">種類でフィルタリング:</label>
-                        <select
-                            id="filter-type"
-                            value={filterJobType}
-                            onChange={(e) => setFilterJobType(e.target.value)}
-                            className="p-3 border border-gray-300 rounded-lg bg-white focus:ring-2 focus:ring-blue-400 focus:border-transparent transition duration-200 w-full"
-                        >
-                            <option value="すべて">すべて</option>
-                            {JOB_TYPES.map(type => (
-                                <option key={type} value={type}>{type}</option>
-                            ))}
-                        </select>
-                    </div>
-                    <div className="flex-1">
-                        <label htmlFor="filter-status" className="text-gray-700 font-medium mb-2 block">ステータスでフィルタリング:</label>
-                        <select
-                            id="filter-status"
-                            value={filterCompletionStatus}
-                            onChange={(e) => setFilterCompletionStatus(e.target.value)}
-                            className="p-3 border border-gray-300 rounded-lg bg-white focus:ring-2 focus:ring-blue-400 focus:border-transparent transition duration-200 w-full"
-                        >
-                            <option value="すべて">すべて</option>
-                            <option value="完了">完了</option>
-                            <option value="未完了">未完了</option>
-                        </select>
-                    </div>
-                </div>
-
-                {/* Job List */}
-                <div>
-                    <h2 className="text-2xl font-semibold text-gray-800 mb-4">仕事リスト ({selectedMonth})</h2>
-                    {filteredJobs.length === 0 ? (
-                        <p className="text-gray-600 text-center py-8">この月には、現在のフィルター条件に一致する仕事がありません。</p>
-                    ) : (
-                        <div className="space-y-4">
-                            {filteredJobs.map((job) => (
-                                <div
-                                    key={job.id}
-                                    className={`p-5 rounded-lg shadow-md flex flex-col sm:flex-row items-start sm:items-center justify-between transition duration-300 ease-in-out
-                                        ${job.completed ? 'bg-green-50 border-l-4 border-green-500' :
-                                          job.inProgress ? 'bg-yellow-50 border-l-4 border-yellow-500' :
-                                          'bg-white border-l-4 border-gray-200'}`
-                                    }
-                                >
-                                    <div className="flex-grow mb-3 sm:mb-0">
-                                        <h3 className="text-lg font-medium text-gray-900">{job.title}</h3>
-                                        <p className="text-sm text-gray-600">
-                                            <span className={`inline-block px-2 py-0.5 rounded-full text-xs font-semibold ${
-                                                job.type === '阪急' ? 'bg-blue-200 text-blue-800' :
-                                                job.type === 'リール' ? 'bg-indigo-200 text-indigo-800' :
-                                                'bg-gray-200 text-gray-800'
-                                            } mr-2`}>{job.type}</span>
-                                            {job.inProgressDate && (
-                                                <span className="mr-2">入稿: {new Date(job.inProgressDate).toLocaleDateString('ja-JP')}</span>
-                                            )}
-                                            {job.completedDate && (
-                                                <span>完了: {new Date(job.completedDate).toLocaleDateString('ja-JP')}</span>
-                                            )}
-                                        </p>
-                                    </div>
-                                    <div className="flex flex-wrap gap-2">
-                                        <button
-                                            onClick={() => updateJobStatus(job.id, job.inProgress, 'inProgress')}
-                                            className={`py-2 px-4 rounded-full text-sm font-semibold shadow-sm transition duration-300 ease-in-out
-                                                ${job.inProgress ? 'bg-yellow-500 hover:bg-yellow-600 text-white' : 'bg-gray-200 hover:bg-gray-300 text-gray-800'}`}
-                                        >
-                                            {job.inProgress ? '入稿済み' : '入稿する'}
-                                        </button>
-                                        <button
-                                            onClick={() => updateJobStatus(job.id, job.completed, 'completed')}
-                                            className={`py-2 px-4 rounded-full text-sm font-semibold shadow-sm transition duration-300 ease-in-out
-                                                ${job.completed ? 'bg-green-500 hover:bg-green-600 text-white' : 'bg-gray-200 hover:bg-gray-300 text-gray-800'}`}
-                                        >
-                                            {job.completed ? '完了済み' : '完了する'}
-                                        </button>
-                                        <button
-                                            onClick={() => confirmDeleteJob(job)}
-                                            className="py-2 px-4 rounded-full text-sm font-semibold bg-red-100 hover:bg-red-200 text-red-700 shadow-sm transition duration-300 ease-in-out"
-                                        >
-                                            削除
-                                        </button>
-                                    </div>
-                                </div>
-                            ))}
-                        </div>
-                    )}
-                </div>
+        <!-- 新規タスク追加フォーム -->
+        <div class="mb-8 p-6 bg-purple-50 rounded-lg shadow-md">
+            <h3 class="text-xl font-semibold text-purple-700 mb-4">新規タスク追加</h3>
+            <div class="grid grid-cols-1 md:grid-cols-3 gap-4">
+                <input type="text" id="taskDescriptionInput" placeholder="タスクの内容" class="p-3 border border-gray-300 rounded-lg focus:ring-purple-500 focus:border-purple-500 md:col-span-2">
+                <select id="taskTypeSelect" class="p-3 border border-gray-300 rounded-lg focus:ring-purple-500 focus:border-purple-500">
+                    <option value="hankyu">阪急</option>
+                    <option value="reel">リール</option>
+                    <option value="other">その他</option>
+                </select>
+                <button id="addTaskBtn" class="md:col-span-3 px-4 py-3 bg-purple-600 text-white rounded-lg hover:bg-purple-700 transition duration-200 ease-in-out shadow-md font-bold">
+                    タスクを追加
+                </button>
             </div>
         </div>
-    );
-};
 
-export default App;
+        <!-- タスク表示エリア -->
+        <div id="tasksContainer" class="space-y-8">
+            <!-- 各カテゴリのタスクが表示される -->
+        </div>
+    </div>
+
+    <script type="module">
+        // グローバル変数とFirebaseの設定
+        const appId = typeof __app_id !== 'undefined' ? __app_id : 'default-app-id';
+        const firebaseConfig = typeof __firebase_config !== 'undefined' ? JSON.parse(__firebase_config) : {};
+        const initialAuthToken = typeof __initial_auth_token !== 'undefined' ? __initial_auth_token : null;
+
+        // Firebase SDKのインポート (type="module" で直接インポート)
+        import { initializeApp } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-app.js";
+        import { getAuth, signInAnonymously, signInWithCustomToken, onAuthStateChanged } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-auth.js";
+        import { getFirestore, doc, setDoc, collection, query, onSnapshot, addDoc, updateDoc, deleteDoc } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-firestore.js";
+
+        // Firebase初期化と認証
+        let app, db, auth;
+        let userId = null; // ユーザーIDを保持する変数
+        let isAuthReady = false; // 認証準備完了フラグ
+
+        // DOM要素の取得
+        const displayUserId = document.getElementById('displayUserId');
+        const currentMonthDisplay = document.getElementById('currentMonthDisplay');
+        const prevMonthBtn = document.getElementById('prevMonthBtn');
+        const nextMonthBtn = document.getElementById('nextMonthBtn');
+        const taskDescriptionInput = document.getElementById('taskDescriptionInput');
+        const taskTypeSelect = document.getElementById('taskTypeSelect');
+        const addTaskBtn = document.getElementById('addTaskBtn');
+        const tasksContainer = document.getElementById('tasksContainer');
+
+        // Firebaseの初期化と認証状態の監視
+        try {
+            app = initializeApp(firebaseConfig);
+            db = getFirestore(app);
+            auth = getAuth(app);
+
+            onAuthStateChanged(auth, async (user) => {
+                if (user) {
+                    userId = user.uid;
+                    displayUserId.textContent = userId; // ユーザーIDを表示
+                    console.log("Authenticated user ID:", userId);
+                } else {
+                    if (initialAuthToken) {
+                        try {
+                            await signInWithCustomToken(auth, initialAuthToken);
+                            userId = auth.currentUser.uid;
+                            displayUserId.textContent = userId; // ユーザーIDを表示
+                            console.log("Signed in with custom token. User ID:", userId);
+                        } catch (error) {
+                            console.error("Custom token sign-in failed:", error);
+                            await signInAnonymously(auth);
+                            userId = auth.currentUser.uid;
+                            displayUserId.textContent = userId; // ユーザーIDを表示
+                            console.log("Signed in anonymously due to custom token failure. User ID:", userId);
+                        }
+                    } else {
+                        await signInAnonymously(auth);
+                        userId = auth.currentUser.uid;
+                        displayUserId.textContent = userId; // ユーザーIDを表示
+                        console.log("Signed in anonymously. User ID:", userId);
+                    }
+                }
+                isAuthReady = true;
+                // 認証準備が完了したら、Firestoreからのデータ購読を開始
+                setupFirestoreListener();
+            });
+        } catch (error) {
+            console.error("Firebase initialization failed:", error);
+            displayUserId.textContent = "エラー: 認証失敗";
+        }
+
+
+        // アプリケーションの状態
+        let tasks = []; // 全てのタスクを保持
+        let currentMonth = new Date(); // 現在表示している月
+
+        // Firestoreリスナーの設定
+        function setupFirestoreListener() {
+            if (!isAuthReady || !userId) {
+                console.log("Firestore listener not ready: Auth not complete or userId not available.");
+                return;
+            }
+
+            // 公開コレクションのパス
+            const tasksCollectionRef = collection(db, `artifacts/${appId}/public/data/tasks`);
+
+            onSnapshot(tasksCollectionRef, (snapshot) => {
+                const fetchedTasks = [];
+                snapshot.forEach(doc => {
+                    fetchedTasks.push({ id: doc.id, ...doc.data() });
+                });
+                tasks = fetchedTasks; // 全てのタスクを更新
+                renderTasks(); // タスクを再描画
+                console.log("Tasks fetched from Firestore:", tasks);
+            }, (error) => {
+                console.error("Error fetching tasks from Firestore:", error);
+            });
+        }
+
+        // 日付をYYYY-MM-DD形式でフォーマットする関数
+        const formatDate = (date) => {
+            if (!date) return '';
+            const d = new Date(date);
+            const year = d.getFullYear();
+            const month = String(d.getMonth() + 1).padStart(2, '0');
+            const day = String(d.getDate()).padStart(2, '0');
+            return `${year}-${month}-${day}`;
+        };
+
+        // 月表示を更新する関数
+        const updateMonthDisplay = () => {
+            currentMonthDisplay.textContent = `${currentMonth.getFullYear()}年 ${currentMonth.getMonth() + 1}月`;
+            renderTasks();
+        };
+
+        // タスクを追加する関数
+        const addTask = async () => {
+            if (!isAuthReady || !userId) {
+                console.log("Cannot add task: Auth not complete or userId not available.");
+                // カスタムモーダルでユーザーに通知することを推奨
+                console.warn("タスクを追加できません。認証が完了していないか、ユーザーIDが利用できません。");
+                return;
+            }
+
+            const description = taskDescriptionInput.value.trim();
+            const type = taskTypeSelect.value;
+            if (description === '') {
+                // alert('タスクの内容を入力してください。'); // カスタムモーダルに置き換えるべき
+                console.warn('タスクの内容を入力してください。');
+                return;
+            }
+
+            const now = new Date();
+            const newTask = {
+                description: description,
+                type: type,
+                submittedDate: now.toISOString(), // ISO形式で保存
+                finishedDate: null,
+                status: 'submitted', // 初期状態は'submitted'とする
+                createdAt: now.toISOString(), // 作成日時
+                userId: userId // 誰が追加したか
+            };
+
+            try {
+                // Firestoreに新しいドキュメントを追加
+                await addDoc(collection(db, `artifacts/${appId}/public/data/tasks`), newTask);
+                taskDescriptionInput.value = ''; // 入力フィールドをクリア
+                console.log("Task added to Firestore:", newTask);
+            } catch (e) {
+                console.error("Error adding document: ", e);
+            }
+        };
+
+        // タスクの状態を更新する関数
+        const updateTaskStatus = async (taskId, newStatus) => {
+            if (!isAuthReady || !userId) {
+                console.log("Cannot update task: Auth not complete or userId not available.");
+                // カスタムモーダルでユーザーに通知することを推奨
+                console.warn("タスクを更新できません。認証が完了していないか、ユーザーIDが利用できません。");
+                return;
+            }
+
+            const taskRef = doc(db, `artifacts/${appId}/public/data/tasks`, taskId);
+            const now = new Date().toISOString();
+            let updateData = { status: newStatus };
+
+            if (newStatus === 'finished') {
+                updateData.finishedDate = now;
+            } else if (newStatus === 'submitted') {
+                // 'submitted'に戻す場合、finishedDateをクリア
+                updateData.finishedDate = null;
+            }
+
+            try {
+                await updateDoc(taskRef, updateData);
+                console.log(`Task ${taskId} status updated to ${newStatus}`);
+            } catch (e) {
+                console.error("Error updating document: ", e);
+            }
+        };
+
+        // タスクを削除する関数
+        const deleteTask = async (taskId) => {
+            if (!isAuthReady || !userId) {
+                console.log("Cannot delete task: Auth not complete or userId not available.");
+                // カスタムモーダルでユーザーに通知することを推奨
+                console.warn("タスクを削除できません。認証が完了していないか、ユーザーIDが利用できません。");
+                return;
+            }
+
+            // 確認ダイアログの代わりにカスタムモーダルを使用することを推奨
+            // if (!confirm('このタスクを削除してもよろしいですか？')) {
+            //     return;
+            // }
+            console.log('タスク削除の確認: このタスクを削除してもよろしいですか？'); // デバッグ用
+
+            // ユーザーが実際に削除を意図しているかを確認するロジック（カスタムモーダルなど）をここに追加
+            // 例: 簡略化のため、ここでは直接削除を実行
+            try {
+                await deleteDoc(doc(db, `artifacts/${appId}/public/data/tasks`, taskId));
+                console.log(`Task ${taskId} deleted.`);
+            } catch (e) {
+                console.error("Error deleting document: ", e);
+            }
+        };
+
+        // タスクをレンダリングする関数
+        const renderTasks = () => {
+            tasksContainer.innerHTML = ''; // コンテナをクリア
+
+            const currentYear = currentMonth.getFullYear();
+            const currentMonthIndex = currentMonth.getMonth(); // 0-11
+
+            const categories = {
+                hankyu: { name: '阪急', incomplete: [], completed: [] },
+                reel: { name: 'リール', incomplete: [], completed: [] },
+                other: { name: 'その他', incomplete: [], completed: [] },
+            };
+
+            // タスクをフィルタリングしてカテゴリに分類
+            tasks.forEach(task => {
+                const submittedDate = new Date(task.submittedDate);
+                const taskYear = submittedDate.getFullYear();
+                const taskMonth = submittedDate.getMonth();
+
+                // 未完了のタスクは、提出された月が過去であっても現在の月に表示
+                if (task.status !== 'finished') {
+                    if (categories[task.type]) {
+                        categories[task.type].incomplete.push(task);
+                    }
+                } else {
+                    // 完了したタスクは、そのタスクが提出された月にのみ表示
+                    if (taskYear === currentYear && taskMonth === currentMonthIndex) {
+                        if (categories[task.type]) {
+                            categories[task.type].completed.push(task);
+                        }
+                    }
+                }
+            });
+
+            // 各カテゴリと完了状況で表示
+            for (const type in categories) {
+                const category = categories[type];
+                const typeName = category.name;
+
+                // カテゴリごとのセクション
+                const typeSection = document.createElement('div');
+                typeSection.className = 'bg-white rounded-lg shadow-md mb-6';
+                typeSection.innerHTML = `
+                    <h3 class="text-xl font-semibold text-gray-800 p-4 bg-gray-100 rounded-t-lg">${typeName}</h3>
+                    <div class="p-4">
+                        <h4 class="text-lg font-medium text-red-600 mb-3">未完了の仕事</h4>
+                        <div id="${type}-incomplete-tasks" class="space-y-3">
+                            ${category.incomplete.length === 0 ? '<p class="text-gray-500">未完了の仕事はありません。</p>' : ''}
+                        </div>
+                        <h4 class="text-lg font-medium text-green-600 mt-6 mb-3">完了した仕事</h4>
+                        <div id="${type}-completed-tasks" class="space-y-3">
+                            ${category.completed.length === 0 ? '<p class="text-gray-500">完了した仕事はありません。</p>' : ''}
+                        </div>
+                    </div>
+                `;
+                tasksContainer.appendChild(typeSection);
+
+                // 未完了タスクのレンダリング
+                const incompleteTasksDiv = typeSection.querySelector(`#${type}-incomplete-tasks`);
+                category.incomplete.forEach(task => {
+                    const taskElement = createTaskElement(task);
+                    incompleteTasksDiv.appendChild(taskElement);
+                });
+
+                // 完了タスクのレンダリング
+                const completedTasksDiv = typeSection.querySelector(`#${type}-completed-tasks`);
+                category.completed.forEach(task => {
+                    const taskElement = createTaskElement(task);
+                    completedTasksDiv.appendChild(taskElement);
+                });
+            }
+        };
+
+        // 個々のタスク要素を作成するヘルパー関数
+        const createTaskElement = (task) => {
+            const taskDiv = document.createElement('div');
+            taskDiv.id = `task-${task.id}`;
+            taskDiv.className = `p-4 border rounded-lg shadow-sm flex flex-col md:flex-row justify-between items-start md:items-center ${task.status === 'finished' ? 'bg-green-50 border-green-200' : 'bg-yellow-50 border-yellow-200'}`;
+
+            taskDiv.innerHTML = `
+                <div class="flex-grow mb-2 md:mb-0">
+                    <p class="text-lg font-semibold text-gray-800">${task.description}</p>
+                    <p class="text-sm text-gray-600">
+                        入稿日: ${formatDate(task.submittedDate)}
+                        ${task.finishedDate ? ` | 終了日: ${formatDate(task.finishedDate)}` : ''}
+                    </p>
+                    <p class="text-xs text-gray-500">
+                        ユーザーID: ${task.userId}
+                    </p>
+                </div>
+                <div class="flex space-x-2 flex-wrap justify-end">
+                    ${task.status !== 'finished' ? `<button data-id="${task.id}" data-action="finish" class="px-3 py-1 bg-green-500 text-white text-sm rounded-md hover:bg-green-600 transition duration-200 ease-in-out shadow-sm">終了</button>` : ''}
+                    ${task.status !== 'submitted' ? `<button data-id="${task.id}" data-action="submit" class="px-3 py-1 bg-blue-500 text-white text-sm rounded-md hover:bg-blue-600 transition duration-200 ease-in-out shadow-sm">入稿</button>` : ''}
+                    <button data-id="${task.id}" data-action="delete" class="px-3 py-1 bg-red-500 text-white text-sm rounded-md hover:bg-red-600 transition duration-200 ease-in-out shadow-sm">削除</button>
+                </div>
+            `;
+
+            // イベントリスナーをアタッチ
+            taskDiv.querySelectorAll('button').forEach(button => {
+                button.addEventListener('click', (e) => {
+                    const taskId = e.target.dataset.id;
+                    const action = e.target.dataset.action;
+                    if (action === 'finish') {
+                        updateTaskStatus(taskId, 'finished');
+                    } else if (action === 'submit') {
+                        updateTaskStatus(taskId, 'submitted');
+                    } else if (action === 'delete') {
+                        deleteTask(taskId);
+                    }
+                });
+            });
+
+            return taskDiv;
+        };
+
+        // イベントリスナー
+        prevMonthBtn.addEventListener('click', () => {
+            currentMonth.setMonth(currentMonth.getMonth() - 1);
+            updateMonthDisplay();
+        });
+
+        nextMonthBtn.addEventListener('click', () => {
+            currentMonth.setMonth(currentMonth.getMonth() + 1);
+            updateMonthDisplay();
+        });
+
+        addTaskBtn.addEventListener('click', addTask);
+
+        // 初期表示
+        updateMonthDisplay();
+    </script>
+</body>
+</html>
